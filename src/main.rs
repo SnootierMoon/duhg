@@ -4,6 +4,7 @@ use noise::{NoiseFn, Perlin};
 use rand::Rng;
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
+use wgpu::PresentMode;
 use winit::event::{DeviceEvent, ElementState};
 use winit::window::CursorGrabMode;
 use winit::{
@@ -20,7 +21,7 @@ struct State {
 
     camera: Camera,
     time: Instant,
-    delta_time: Duration,
+    delta_time: f32,
 
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -44,7 +45,7 @@ impl State {
             forward: Vec3A::new(1.0, 0.0, 0.0),
             pitch: 0.0,
 
-            speed: 0.001,
+            speed: 1.0,
             sens: 0.01,
 
             aspect_ratio: size.width as f32 / size.height as f32,
@@ -93,7 +94,7 @@ impl State {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
         };
@@ -218,7 +219,7 @@ impl State {
             move_keys_held: [false; 6],
             camera,
             time: Instant::now(),
-            delta_time: Duration::ZERO,
+            delta_time: 0.0,
             surface,
             device,
             queue,
@@ -256,7 +257,7 @@ impl State {
 
     fn update(&mut self) {
         let new_time = Instant::now();
-        self.delta_time = new_time.duration_since(self.time);
+        self.delta_time = new_time.duration_since(self.time).as_secs_f32();
         self.time = new_time;
         let mut move_vec = Vec3A::ZERO;
         if self.move_keys_held[0] {
@@ -277,7 +278,7 @@ impl State {
         if self.move_keys_held[5] {
             move_vec.z -= 1.0;
         }
-        self.camera.update_pos(move_vec);
+        self.camera.update_pos(move_vec * self.delta_time);
 
         self.queue.write_buffer(
             &self.camera_buffer,
