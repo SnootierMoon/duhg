@@ -1,12 +1,12 @@
-use glam::{Mat4, Quat, Vec2, Vec3, Vec3A};
-use hexasphere::shapes::IcoSphere;
+use glam::{Mat4, Quat, Vec2, Vec3A};
+use hexasphere::shapes::{IcoSphere, IcoSphereBase};
+use hexasphere::Subdivided;
 use noise::{NoiseFn, Perlin};
 use rand::Rng;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 use wgpu::PresentMode;
 use winit::event::{DeviceEvent, ElementState};
-use winit::window::CursorGrabMode;
 use winit::{
     dpi::PhysicalSize,
     event::{Event, KeyboardInput, VirtualKeyCode, WindowEvent},
@@ -19,6 +19,7 @@ struct State {
     size: PhysicalSize<u32>,
     move_keys_held: [bool; 6],
 
+    sphere: Subdivided<(), IcoSphereBase>,
     camera: Camera,
     time: Instant,
     delta_time: f32,
@@ -32,6 +33,7 @@ struct State {
     index_buffer: wgpu::Buffer,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    depth: Texture,
     num_indices: u32,
 }
 
@@ -73,7 +75,7 @@ impl State {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: None,
+                    label: Some("Device"),
                     features: wgpu::Features::empty(),
                     limits: wgpu::Limits::default(),
                 },
@@ -169,6 +171,8 @@ impl State {
             }],
         });
 
+        let depth = Texture::create_depth_texture(&device, &config, "Depth");
+
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -204,7 +208,13 @@ impl State {
                 conservative: false,
             },
 
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: Texture::DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -217,6 +227,7 @@ impl State {
             window,
             size,
             move_keys_held: [false; 6],
+            sphere,
             camera,
             time: Instant::now(),
             delta_time: 0.0,
@@ -229,6 +240,7 @@ impl State {
             index_buffer,
             camera_buffer,
             camera_bind_group,
+            depth,
             num_indices: indices.len() as u32,
         }
     }
@@ -240,6 +252,7 @@ impl State {
             self.config.height = new_size.height;
             self.camera.aspect_ratio = new_size.width as f32 / new_size.height as f32;
             self.surface.configure(&self.device, &self.config);
+            self.depth = Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
     }
 
@@ -289,9 +302,10 @@ impl State {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Surface Texture View"),
+            ..Default::default()
+        });
 
         let mut encoder = self
             .device
@@ -314,7 +328,14 @@ impl State {
                     store: true,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: true,
+                }),
+                stencil_ops: None,
+            }),
         });
 
         render_pass.set_pipeline(&self.render_pipeline);
@@ -387,6 +408,62 @@ impl State {
             }
             _ => {}
         })
+    }
+}
+
+struct Texture {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+}
+
+impl Texture {
+    pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float; // 1.
+
+    pub fn create_depth_texture(
+        device: &wgpu::Device,
+        config: &wgpu::SurfaceConfiguration,
+        label: &str,
+    ) -> Self {
+        let size = wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(&(label.to_string() + " Texture")),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some(&(label.to_string() + " View")),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some(&(label.to_string() + " Sampler")),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 100.0,
+            ..Default::default()
+        });
+
+        Self {
+            texture,
+            view,
+            sampler,
+        }
     }
 }
 
