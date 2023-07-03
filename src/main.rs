@@ -1,18 +1,19 @@
 use glam::{Mat4, Quat, Vec2, Vec3A};
-use hexasphere::shapes::{IcoSphere, IcoSphereBase};
-use hexasphere::Subdivided;
+use hexasphere::{
+    shapes::{IcoSphere, IcoSphereBase},
+    Subdivided,
+};
 use noise::{NoiseFn, Perlin};
 use rand::Rng;
 use std::time::Instant;
-use wgpu::util::DeviceExt;
-use wgpu::PresentMode;
-use winit::dpi::PhysicalPosition;
-use winit::event::{DeviceEvent, ElementState, MouseButton};
-use winit::window::CursorGrabMode;
+use wgpu::{util::DeviceExt, PresentMode};
 use winit::{
+    dpi::PhysicalPosition,
     dpi::PhysicalSize,
+    event::{DeviceEvent, ElementState, MouseButton},
     event::{Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
+    window::CursorGrabMode,
     window::{Window, WindowBuilder},
 };
 
@@ -53,8 +54,10 @@ impl State {
             forward: Vec3A::new(1.0, 0.0, 0.0),
             pitch: 0.0,
 
-            speed: 1.0,
+            vel: Vec3A::ZERO,
+            speed: 0.5,
             sens: 0.01,
+            drag: 0.999,
 
             aspect_ratio: size.width as f32 / size.height as f32,
             fov_y_radians: std::f32::consts::FRAC_PI_4,
@@ -317,7 +320,7 @@ impl State {
         if self.move_keys_held[5] {
             move_vec.z -= 1.0;
         }
-        self.camera.update_position(move_vec * self.delta_time);
+        self.camera.update_position(move_vec, self.delta_time);
 
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -539,8 +542,10 @@ struct Camera {
     forward: Vec3A,
     pitch: f32, // [-pi/2, pi/2]
 
+    vel: Vec3A,
     speed: f32,
     sens: f32,
+    drag: f32,
 
     aspect_ratio: f32,
     fov_y_radians: f32,
@@ -572,8 +577,9 @@ impl Camera {
     }
 
     // forward, left, up
-    fn update_position(&mut self, delta: Vec3A) {
-        let h_move = self.speed * (delta.x * self.forward + delta.y * self.left());
+    fn update_position(&mut self, accel: Vec3A, delta_time: f32) {
+        self.vel = (1.0 - self.drag).powf(delta_time) * self.vel + self.speed * accel * delta_time;
+        let h_move = self.vel.x * self.forward + self.vel.y * self.left();
         let rot_axis = self.position.cross(h_move).normalize_or_zero();
         let rot = Quat::from_axis_angle(
             rot_axis.into(),
@@ -581,7 +587,7 @@ impl Camera {
         );
         self.position = rot * self.position;
         self.forward = (rot * self.forward).reject_from(self.position).normalize();
-        self.position += self.position.normalize() * delta.z;
+        self.position += self.position.normalize() * self.vel.z;
     }
 
     // left, up
