@@ -6,7 +6,9 @@ use rand::Rng;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use wgpu::PresentMode;
-use winit::event::{DeviceEvent, ElementState};
+use winit::dpi::PhysicalPosition;
+use winit::event::{DeviceEvent, ElementState, MouseButton};
+use winit::window::CursorGrabMode;
 use winit::{
     dpi::PhysicalSize,
     event::{Event, KeyboardInput, VirtualKeyCode, WindowEvent},
@@ -14,15 +16,20 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+type Sphere = Subdivided<(), IcoSphereBase>;
+
 struct State {
     window: Window,
     size: PhysicalSize<u32>,
-    move_keys_held: [bool; 6],
 
-    sphere: Subdivided<(), IcoSphereBase>,
-    camera: Camera,
     time: Instant,
     delta_time: f32,
+    move_keys_held: [bool; 6],
+    cursor_pos: Option<PhysicalPosition<f64>>,
+    input_mode: InputMode,
+
+    sphere: Sphere,
+    camera: Camera,
 
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -40,10 +47,9 @@ struct State {
 impl State {
     async fn new(window: Window) -> Self {
         let size = window.inner_size();
-        window.set_cursor_visible(false);
 
         let camera = Camera {
-            pos: Vec3A::new(0.0, 2.0, 0.0),
+            position: Vec3A::new(0.0, 2.0, 0.0),
             forward: Vec3A::new(1.0, 0.0, 0.0),
             pitch: 0.0,
 
@@ -102,7 +108,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let sphere = IcoSphere::new(10, |_| ());
+        let sphere = IcoSphere::new(1, |_| ());
 
         let min_radius = 0.7f32;
         let max_radius = 1.0f32;
@@ -226,11 +232,13 @@ impl State {
         Self {
             window,
             size,
-            move_keys_held: [false; 6],
-            sphere,
-            camera,
             time: Instant::now(),
             delta_time: 0.0,
+            move_keys_held: [false; 6],
+            cursor_pos: None,
+            input_mode: InputMode::Cursor,
+            sphere,
+            camera,
             surface,
             device,
             queue,
@@ -242,6 +250,24 @@ impl State {
             camera_bind_group,
             depth,
             num_indices: indices.len() as u32,
+        }
+    }
+
+    pub fn set_input_mode(&mut self, input_mode: InputMode) {
+        self.input_mode = input_mode;
+        if input_mode == InputMode::Camera {
+            _ = self
+                .window
+                .set_cursor_grab(CursorGrabMode::Confined)
+                .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Locked));
+            self.window.set_cursor_visible(false);
+        } else {
+            _ = self.window.set_cursor_grab(CursorGrabMode::None);
+            _ = self.window.set_cursor_position(PhysicalPosition::new(
+                self.size.width / 2,
+                self.size.height / 2,
+            ));
+            self.window.set_cursor_visible(true);
         }
     }
 
@@ -291,7 +317,7 @@ impl State {
         if self.move_keys_held[5] {
             move_vec.z -= 1.0;
         }
-        self.camera.update_pos(move_vec * self.delta_time);
+        self.camera.update_position(move_vec * self.delta_time);
 
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -354,21 +380,60 @@ impl State {
     fn run(mut self, event_loop: EventLoop<()>) {
         event_loop.run(move |event, _, control_flow| match event {
             Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::KeyboardInput {
                     input:
                         KeyboardInput {
                             virtual_keycode: Some(VirtualKeyCode::Escape),
+                            state: ElementState::Pressed,
                             ..
                         },
                     ..
-                } => *control_flow = ControlFlow::Exit,
+                } => {
+                    if self.input_mode == InputMode::Camera {
+                        self.set_input_mode(InputMode::Cursor);
+                    } else {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
                 WindowEvent::Resized(physical_size)
                 | WindowEvent::ScaleFactorChanged {
                     new_inner_size: &mut physical_size,
                     ..
                 } => {
                     self.resize(physical_size);
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_pos = Some(position);
+                }
+                WindowEvent::CursorLeft { device_id } => {
+                    self.cursor_pos = None;
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    if self.input_mode == InputMode::Cursor {
+                        self.set_input_mode(InputMode::Camera);
+                    }
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button: MouseButton::Right,
+                    ..
+                } => {
+                    if self.input_mode == InputMode::Cursor {
+                        if let Some(pos) = self.cursor_pos {
+                            let scaled_coords = 1.0
+                                - 2.0
+                                    * Vec2::new(
+                                        pos.x as f32 / self.size.width as f32,
+                                        pos.y as f32 / self.size.height as f32,
+                                    );
+                            self.camera.hit(&self.sphere, scaled_coords);
+                        }
+                    }
                 }
                 WindowEvent::KeyboardInput {
                     input:
@@ -387,8 +452,10 @@ impl State {
             },
             Event::DeviceEvent { event, .. } => match event {
                 DeviceEvent::MouseMotion { delta, .. } => {
-                    self.camera
-                        .update_dir(Vec2::new(-delta.0 as f32, -delta.1 as f32));
+                    if self.input_mode == InputMode::Camera {
+                        self.camera
+                            .update_direction(Vec2::new(-delta.0 as f32, -delta.1 as f32));
+                    }
                 }
                 _ => {}
             },
@@ -468,7 +535,7 @@ impl Texture {
 }
 
 struct Camera {
-    pos: Vec3A,
+    position: Vec3A,
     forward: Vec3A,
     pitch: f32, // [-pi/2, pi/2]
 
@@ -483,10 +550,9 @@ struct Camera {
 
 impl Camera {
     fn matrix(&self) -> Mat4 {
-        let up = self.pos.normalize();
-        let (sin, cos) = self.pitch.sin_cos();
-        let center = self.pos + self.forward * cos + self.pos.normalize() * sin;
-        let view = Mat4::look_at_rh(self.pos.into(), center.into(), up.into());
+        let up = self.position.normalize();
+        let center = self.position + self.direction();
+        let view = Mat4::look_at_rh(self.position.into(), center.into(), up.into());
         let proj = Mat4::perspective_rh(
             self.fov_y_radians,
             self.aspect_ratio,
@@ -495,27 +561,67 @@ impl Camera {
         );
         proj * view
     }
+
+    fn direction(&self) -> Vec3A {
+        let (sin, cos) = self.pitch.sin_cos();
+        self.forward * cos + self.position.normalize() * sin
+    }
+
+    fn left(&self) -> Vec3A {
+        self.position.cross(self.forward).normalize()
+    }
+
     // forward, left, up
-    fn update_pos(&mut self, delta: Vec3A) {
-        let delta = delta * self.speed;
-        let left = self.pos.cross(self.forward).normalize();
-        let h_move = delta.x * self.forward + delta.y * left;
-        let rot_axis = self.pos.cross(h_move).normalize_or_zero();
-        let rot = Quat::from_axis_angle(rot_axis.into(), h_move.length() * self.pos.length_recip());
-        self.pos = rot * self.pos;
-        self.forward = (rot * self.forward).reject_from(self.pos).normalize();
-        self.pos += self.pos.normalize() * delta.z;
+    fn update_position(&mut self, delta: Vec3A) {
+        let h_move = self.speed * (delta.x * self.forward + delta.y * self.left());
+        let rot_axis = self.position.cross(h_move).normalize_or_zero();
+        let rot = Quat::from_axis_angle(
+            rot_axis.into(),
+            h_move.length() * self.position.length_recip(),
+        );
+        self.position = rot * self.position;
+        self.forward = (rot * self.forward).reject_from(self.position).normalize();
+        self.position += self.position.normalize() * delta.z;
     }
 
     // left, up
-    fn update_dir(&mut self, delta: Vec2) {
-        let delta = delta * self.sens;
-        self.pitch = (self.pitch + delta.y).clamp(
+    fn update_direction(&mut self, delta: Vec2) {
+        let delta_sens = delta * self.sens;
+        self.pitch = (self.pitch + delta_sens.y).clamp(
             -std::f32::consts::FRAC_PI_2 + 0.001,
             std::f32::consts::FRAC_PI_2 - 0.001,
         );
-        let rot = Quat::from_axis_angle(self.pos.normalize().into(), delta.x);
+        let rot = Quat::from_axis_angle(self.position.normalize().into(), delta_sens.x);
         self.forward = (rot * self.forward).normalize();
+    }
+
+    fn hit(&mut self, sphere: &Sphere, cursor_coords: Vec2) -> Option<f32> {
+        let tan_half_fov_y = (self.fov_y_radians * 0.5).tan();
+        let dir = self.direction().normalize();
+        let left = self.left().normalize();
+        let up = dir.cross(left).normalize();
+        let ray_dir = dir
+            + (cursor_coords.x * left * self.aspect_ratio + cursor_coords.y * up) * tan_half_fov_y;
+        let points = sphere.raw_points();
+        sphere
+            .get_all_indices()
+            .chunks(3)
+            .enumerate()
+            .filter_map(|(i, tri)| {
+                ray_tri_hit(
+                    self.position,
+                    ray_dir,
+                    points[tri[0] as usize],
+                    points[tri[1] as usize],
+                    points[tri[2] as usize],
+                )
+                .map(|t| (t, i, tri[0], tri[1], tri[2]))
+            })
+            .min_by(|(t1, ..), (t2, ..)| t1.partial_cmp(t2).unwrap())
+            .map(|(t, i, i0, i1, i2)| {
+                println!("{i} {t}");
+                t
+            })
     }
 }
 
@@ -532,6 +638,37 @@ impl Vertex {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
     };
+}
+
+fn ray_tri_hit(orig: Vec3A, dir: Vec3A, v0: Vec3A, v1: Vec3A, v2: Vec3A) -> Option<f32> {
+    let (e1, e2) = (v1 - v0, v2 - v0);
+    let h = dir.cross(e2);
+    let a = e1.dot(h);
+    if a.abs() < 1e-5 {
+        return None;
+    }
+    let f = a.recip();
+    let s = orig - v0;
+    let u = f * s.dot(h);
+    if u < 0.0 || u > 1.0 {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = f * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = f * e2.dot(q);
+    if t < 0.0 {
+        return None;
+    }
+    Some(t)
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum InputMode {
+    Camera,
+    Cursor,
 }
 
 fn main() {
