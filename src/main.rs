@@ -1,4 +1,4 @@
-use glam::{Mat4, Quat, Vec2, Vec3A};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec3A};
 use hexasphere::{
     shapes::{IcoSphere, IcoSphereBase},
     Subdivided,
@@ -17,6 +17,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+const FEPS: f32 = 1e-5;
 type Sphere = Subdivided<(), IcoSphereBase>;
 
 struct State {
@@ -26,7 +27,8 @@ struct State {
     time: Instant,
     delta_time: f32,
     move_keys_held: [bool; 6],
-    cursor_pos: Option<PhysicalPosition<f64>>,
+    cursor_coords: Option<PhysicalPosition<f64>>,
+    held_pos: Option<Vec3A>,
     input_mode: InputMode,
 
     sphere: Sphere,
@@ -50,7 +52,7 @@ impl State {
         let size = window.inner_size();
 
         let camera = Camera {
-            position: Vec3A::new(0.0, 2.0, 0.0),
+            pos: Vec3A::new(0.0, 2.0, 0.0),
             forward: Vec3A::new(1.0, 0.0, 0.0),
             pitch: 0.0,
 
@@ -126,7 +128,7 @@ impl State {
                 let radius = (max_radius - min_radius) * height + min_radius;
                 let point = *point * radius;
                 Vertex {
-                    position: [point.x, point.y, point.z],
+                    pos: [point.x, point.y, point.z],
                     color: [height, height, height],
                 }
             })
@@ -238,7 +240,8 @@ impl State {
             time: Instant::now(),
             delta_time: 0.0,
             move_keys_held: [false; 6],
-            cursor_pos: None,
+            cursor_coords: None,
+            held_pos: None,
             input_mode: InputMode::Cursor,
             sphere,
             camera,
@@ -264,6 +267,7 @@ impl State {
                 .set_cursor_grab(CursorGrabMode::Confined)
                 .or_else(|_| self.window.set_cursor_grab(CursorGrabMode::Locked));
             self.window.set_cursor_visible(false);
+            self.held_pos = None;
         } else {
             _ = self.window.set_cursor_grab(CursorGrabMode::None);
             _ = self.window.set_cursor_position(PhysicalPosition::new(
@@ -272,6 +276,16 @@ impl State {
             ));
             self.window.set_cursor_visible(true);
         }
+    }
+
+    pub fn scaled_cursor_coords(&self) -> Option<Vec2> {
+        self.cursor_coords.map(|coords| {
+            1.0 - 2.0
+                * Vec2::new(
+                    coords.x as f32 / self.size.width as f32,
+                    coords.y as f32 / self.size.height as f32,
+                )
+        })
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -320,7 +334,16 @@ impl State {
         if self.move_keys_held[5] {
             move_vec.z -= 1.0;
         }
-        self.camera.update_position(move_vec, self.delta_time);
+        self.camera.update_pos(move_vec, self.delta_time);
+
+        if let (Some(pos), Some(coords)) = (self.held_pos, self.scaled_cursor_coords()) {
+            let ray_dir = self.camera.ray_dir(coords);
+            let ray_t = ray_sphere_hit_closest(self.camera.pos, ray_dir, pos.length());
+            let move_to = self.camera.pos + ray_dir * ray_t;
+            let rot = Quat::from_rotation_arc(pos.normalize().into(), move_to.normalize().into())
+                .slerp(Quat::IDENTITY, 0.1f32.powf(self.delta_time));
+            self.camera.rotate(rot.inverse());
+        }
 
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -407,10 +430,10 @@ impl State {
                     self.resize(physical_size);
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    self.cursor_pos = Some(position);
+                    self.cursor_coords = Some(position);
                 }
                 WindowEvent::CursorLeft { device_id } => {
-                    self.cursor_pos = None;
+                    self.cursor_coords = None;
                 }
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
@@ -422,19 +445,34 @@ impl State {
                     }
                 }
                 WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
                     button: MouseButton::Right,
+                    state,
                     ..
                 } => {
                     if self.input_mode == InputMode::Cursor {
-                        if let Some(pos) = self.cursor_pos {
-                            let scaled_coords = 1.0
-                                - 2.0
-                                    * Vec2::new(
-                                        pos.x as f32 / self.size.width as f32,
-                                        pos.y as f32 / self.size.height as f32,
-                                    );
-                            self.camera.hit(&self.sphere, scaled_coords);
+                        if state == ElementState::Pressed {
+                            if let Some(coords) = self.scaled_cursor_coords() {
+                                let ray_dir = self.camera.ray_dir(coords);
+                                let points = self.sphere.raw_points();
+                                self.held_pos = self
+                                    .sphere
+                                    .get_all_indices()
+                                    .chunks(3)
+                                    .enumerate()
+                                    .filter_map(|(i, tri)| {
+                                        ray_tri_hit(
+                                            self.camera.pos,
+                                            ray_dir,
+                                            points[tri[0] as usize],
+                                            points[tri[1] as usize],
+                                            points[tri[2] as usize],
+                                        )
+                                    })
+                                    .min_by(|t1, t2| t1.partial_cmp(t2).unwrap())
+                                    .map(|t| self.camera.pos + ray_dir * t);
+                            }
+                        } else {
+                            self.held_pos = None;
                         }
                     }
                 }
@@ -457,7 +495,7 @@ impl State {
                 DeviceEvent::MouseMotion { delta, .. } => {
                     if self.input_mode == InputMode::Camera {
                         self.camera
-                            .update_direction(Vec2::new(-delta.0 as f32, -delta.1 as f32));
+                            .update_dir(Vec2::new(-delta.0 as f32, -delta.1 as f32));
                     }
                 }
                 _ => {}
@@ -538,7 +576,7 @@ impl Texture {
 }
 
 struct Camera {
-    position: Vec3A,
+    pos: Vec3A,
     forward: Vec3A,
     pitch: f32, // [-pi/2, pi/2]
 
@@ -555,9 +593,9 @@ struct Camera {
 
 impl Camera {
     fn matrix(&self) -> Mat4 {
-        let up = self.position.normalize();
-        let center = self.position + self.direction();
-        let view = Mat4::look_at_rh(self.position.into(), center.into(), up.into());
+        let up = self.pos.normalize();
+        let center = self.pos + self.dir();
+        let view = Mat4::look_at_rh(self.pos.into(), center.into(), up.into());
         let proj = Mat4::perspective_rh(
             self.fov_y_radians,
             self.aspect_ratio,
@@ -567,74 +605,59 @@ impl Camera {
         proj * view
     }
 
-    fn direction(&self) -> Vec3A {
+    fn dir(&self) -> Vec3A {
         let (sin, cos) = self.pitch.sin_cos();
-        self.forward * cos + self.position.normalize() * sin
+        self.forward * cos + self.pos.normalize() * sin
     }
 
     fn left(&self) -> Vec3A {
-        self.position.cross(self.forward).normalize()
+        self.pos.cross(self.forward).normalize()
+    }
+
+    fn rotate(&mut self, rot: Quat) {
+        self.pos = rot * self.pos;
+        self.forward = (rot * self.forward).reject_from(self.pos).normalize();
     }
 
     // forward, left, up
-    fn update_position(&mut self, accel: Vec3A, delta_time: f32) {
+    fn update_pos(&mut self, accel: Vec3A, delta_time: f32) {
         self.vel = (1.0 - self.drag).powf(delta_time) * self.vel + self.speed * accel * delta_time;
         let h_move = self.vel.x * self.forward + self.vel.y * self.left();
-        let rot_axis = self.position.cross(h_move).normalize_or_zero();
-        let rot = Quat::from_axis_angle(
-            rot_axis.into(),
-            h_move.length() * self.position.length_recip(),
-        );
-        self.position = rot * self.position;
-        self.forward = (rot * self.forward).reject_from(self.position).normalize();
-        self.position += self.position.normalize() * self.vel.z;
+        if h_move.length() > FEPS {
+            let rot_axis = self.pos.cross(h_move).normalize();
+            let rot =
+                Quat::from_axis_angle(rot_axis.into(), h_move.length() * self.pos.length_recip());
+            self.rotate(rot);
+        }
+        self.pos += self.pos.normalize() * self.vel.z;
     }
 
     // left, up
-    fn update_direction(&mut self, delta: Vec2) {
+    fn update_dir(&mut self, delta: Vec2) {
         let delta_sens = delta * self.sens;
         self.pitch = (self.pitch + delta_sens.y).clamp(
             -std::f32::consts::FRAC_PI_2 + 0.001,
             std::f32::consts::FRAC_PI_2 - 0.001,
         );
-        let rot = Quat::from_axis_angle(self.position.normalize().into(), delta_sens.x);
+        let rot = Quat::from_axis_angle(self.pos.normalize().into(), delta_sens.x);
         self.forward = (rot * self.forward).normalize();
     }
 
-    fn hit(&mut self, sphere: &Sphere, cursor_coords: Vec2) -> Option<f32> {
+    fn ray_dir(&mut self, cursor_coords: Vec2) -> Vec3A {
         let tan_half_fov_y = (self.fov_y_radians * 0.5).tan();
-        let dir = self.direction().normalize();
-        let left = self.left().normalize();
-        let up = dir.cross(left).normalize();
+        let dir = self.dir();
+        let left = self.left();
+        let up = dir.cross(left);
         let ray_dir = dir
             + (cursor_coords.x * left * self.aspect_ratio + cursor_coords.y * up) * tan_half_fov_y;
-        let points = sphere.raw_points();
-        sphere
-            .get_all_indices()
-            .chunks(3)
-            .enumerate()
-            .filter_map(|(i, tri)| {
-                ray_tri_hit(
-                    self.position,
-                    ray_dir,
-                    points[tri[0] as usize],
-                    points[tri[1] as usize],
-                    points[tri[2] as usize],
-                )
-                .map(|t| (t, i, tri[0], tri[1], tri[2]))
-            })
-            .min_by(|(t1, ..), (t2, ..)| t1.partial_cmp(t2).unwrap())
-            .map(|(t, i, i0, i1, i2)| {
-                println!("{i} {t}");
-                t
-            })
+        ray_dir
     }
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
-    position: [f32; 3],
+    pos: [f32; 3],
     color: [f32; 3],
 }
 
@@ -646,21 +669,21 @@ impl Vertex {
     };
 }
 
-fn ray_tri_hit(orig: Vec3A, dir: Vec3A, v0: Vec3A, v1: Vec3A, v2: Vec3A) -> Option<f32> {
+fn ray_tri_hit(ray_origin: Vec3A, ray_dir: Vec3A, v0: Vec3A, v1: Vec3A, v2: Vec3A) -> Option<f32> {
     let (e1, e2) = (v1 - v0, v2 - v0);
-    let h = dir.cross(e2);
+    let h = ray_dir.cross(e2);
     let a = e1.dot(h);
-    if a.abs() < 1e-5 {
+    if a.abs() < FEPS {
         return None;
     }
     let f = a.recip();
-    let s = orig - v0;
+    let s = ray_origin - v0;
     let u = f * s.dot(h);
     if u < 0.0 || u > 1.0 {
         return None;
     }
     let q = s.cross(e1);
-    let v = f * dir.dot(q);
+    let v = f * ray_dir.dot(q);
     if v < 0.0 || u + v > 1.0 {
         return None;
     }
@@ -669,6 +692,19 @@ fn ray_tri_hit(orig: Vec3A, dir: Vec3A, v0: Vec3A, v1: Vec3A, v2: Vec3A) -> Opti
         return None;
     }
     Some(t)
+}
+
+fn ray_sphere_hit_closest(ray_origin: Vec3A, ray_dir: Vec3A, radius: f32) -> f32 {
+    let a = ray_dir.length_squared();
+    let b = 2.0 * ray_origin.dot(ray_dir);
+    let c = ray_origin.length_squared() - radius * radius;
+
+    let disc = b * b - 4.0 * a * c;
+    if disc >= 0.0 {
+        (-b - disc.sqrt()) / (2.0 * a)
+    } else {
+        return -ray_origin.dot(ray_dir) * ray_dir.length_recip();
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
